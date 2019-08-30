@@ -6,9 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +15,6 @@ import (
 	"sort"
 	"strings"
 	texttemplate "text/template"
-	"time"
 	"unicode"
 
 	"github.com/pkg/errors"
@@ -32,8 +29,7 @@ var (
 	flAPIDir      = flag.String("api-dir", "", "api directory (or import path), point this to pkg/apis")
 	flTemplateDir = flag.String("template-dir", "template", "path to template/ dir")
 
-	flHTTPAddr = flag.String("http-addr", "", "start an HTTP server on specified addr to view the result (e.g. :8080)")
-	flOutFile  = flag.String("out-file", "", "path to output file to save the result")
+	flOutDir = flag.String("out-dir", "", "path to the directory to save the results")
 )
 
 type generatorConfig struct {
@@ -81,12 +77,10 @@ func init() {
 	if *flAPIDir == "" {
 		panic("-api-dir not specified")
 	}
-	if *flHTTPAddr == "" && *flOutFile == "" {
+	if *flOutDir == "" {
 		panic("-out-file or -http-addr must be specified")
 	}
-	if *flHTTPAddr != "" && *flOutFile != "" {
-		panic("only -out-file or -http-addr can be specified")
-	}
+
 	if err := resolveTemplateDir(*flTemplateDir); err != nil {
 		panic(err)
 	}
@@ -116,6 +110,7 @@ func main() {
 	d := json.NewDecoder(f)
 	d.DisallowUnknownFields()
 	var config generatorConfig
+
 	if err := d.Decode(&config); err != nil {
 		klog.Fatalf("failed to parse config file: %+v", err)
 	}
@@ -134,49 +129,93 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	mkOutput := func() (string, error) {
-		var b bytes.Buffer
-		err := render(&b, apiPackages, config)
+	typePkgMap := extractTypeToPackageMap(apiPackages)
+
+	for i, apiPkg := range apiPackages {
+		sortTypes(apiPackages[i].Types)
+		dir, err := filepath.Abs(*flOutDir)
 		if err != nil {
-			return "", errors.Wrap(err, "failed to render the result")
+			klog.Fatal(err)
 		}
+		dir = filepath.Join(dir, apiPkg.apiGroup)
+		for _, typ := range apiPkg.Types {
+			if !isExportedType(typ) {
+				break
+			}
 
-		// remove trailing whitespace from each html line for markdown renderers
-		s := regexp.MustCompile(`(?m)^\s+`).ReplaceAllString(b.String(), "")
-		return s, nil
-	}
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				klog.Fatalf("failed to create dir %s: %v", dir, err)
+			}
+			var b bytes.Buffer
 
-	if *flOutFile != "" {
-		dir := filepath.Dir(*flOutFile)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			klog.Fatalf("failed to create dir %s: %v", dir, err)
-		}
-		s, err := mkOutput()
-		if err != nil {
-			klog.Fatalf("failed: %+v", err)
-		}
-		if err := ioutil.WriteFile(*flOutFile, []byte(s), 0644); err != nil {
-			klog.Fatalf("failed to write to out file: %v", err)
-		}
-		klog.Infof("written to %s", *flOutFile)
-	}
+			x := make([]*types.Type, 0)
 
-	if *flHTTPAddr != "" {
-		h := func(w http.ResponseWriter, r *http.Request) {
-			now := time.Now()
-			defer func() { klog.Infof("request took %v", time.Since(now)) }()
-			s, err := mkOutput()
+			fileName := filepath.Join(dir, typ.Name.Name+".html")
+			genMemberTypes(typ, &x, typePkgMap)
+			pkg := apiPackages[i]
+			pkg.Types = x
+
+			var pkgs []*apiPackage
+			pkgs = append(pkgs, pkg)
+
+			references := findTypeReferences(pkgs)
+			typPkgMap := extractTypeToPackageMap(pkgs)
+
+			t, err := template.New("").Funcs(map[string]interface{}{
+				"isExportedType":     isExportedType,
+				"fieldName":          fieldName,
+				"fieldEmbedded":      fieldEmbedded,
+				"typeIdentifier":     func(t *types.Type) string { return typeIdentifier(t) },
+				"typeDisplayName":    func(t *types.Type) string { return typeDisplayName(t, config, typPkgMap) },
+				"visibleTypes":       func(t []*types.Type) []*types.Type { return visibleTypes(t, config) },
+				"renderComments":     func(s []string) string { return renderComments(s, !config.MarkdownDisabled) },
+				"packageDisplayName": func(p *apiPackage) string { return p.identifier() },
+				"apiGroup":           func(t *types.Type) string { return apiGroupForType(t, typPkgMap) },
+				"packageAnchorID": func(p *apiPackage) string {
+					// TODO(ahmetb): currently this is the same as packageDisplayName
+					// func, and it's fine since it retuns valid DOM id strings like
+					// 'serving.knative.dev/v1alpha1' which is valid per HTML5, except
+					// spaces, so just trim those.
+					return strings.Replace(p.identifier(), " ", "", -1)
+				},
+				"linkForType": func(t *types.Type) string {
+					v, err := linkForType(t, config, typPkgMap)
+					if err != nil {
+						klog.Fatal(errors.Wrapf(err, "error getting link for type=%s", t.Name))
+						return ""
+					}
+					return v
+				},
+				"anchorIDForType":  func(t *types.Type) string { return anchorIDForLocalType(t, typPkgMap) },
+				"safe":             safe,
+				"sortedTypes":      sortTypes,
+				"typeReferences":   func(t *types.Type) []*types.Type { return typeReferences(t, config, references) },
+				"hiddenMember":     func(m types.Member) bool { return hiddenMember(m, config) },
+				"isLocalType":      isLocalType,
+				"isOptionalMember": isOptionalMember,
+			}).ParseGlob(filepath.Join(*flTemplateDir, "*.tpl"))
 			if err != nil {
-				fmt.Fprintf(w, "error: %+v", err)
-				klog.Warningf("failed: %+v", err)
+				klog.Fatal(errors.Wrap(err, "parse error"))
 			}
-			if _, err := fmt.Fprint(w, s); err != nil {
-				klog.Warningf("response write error: %v", err)
+
+			gitCommit, _ := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+
+			err = t.ExecuteTemplate(&b, "packages", map[string]interface{}{
+				"packages":  pkgs,
+				"config":    config,
+				"gitCommit": strings.TrimSpace(string(gitCommit)),
+			})
+			if err != nil {
+				klog.Fatal(errors.Wrap(err, "template execution error"))
 			}
+			// remove trailing whitespace from each html line for markdown renderers
+			s := regexp.MustCompile(`(?m)^\s+`).ReplaceAllString(b.String(), "")
+
+			if err := ioutil.WriteFile(fileName, []byte(s), 0644); err != nil {
+				klog.Fatalf("failed to write to out file: %v", err)
+			}
+			klog.Infof("written to %s", fileName)
 		}
-		http.HandleFunc("/", h)
-		klog.Infof("server listening at %s", *flHTTPAddr)
-		klog.Fatal(http.ListenAndServe(*flHTTPAddr, nil))
 	}
 }
 
@@ -332,6 +371,15 @@ func nl2br(s string) string {
 func hiddenMember(m types.Member, c generatorConfig) bool {
 	for _, v := range c.HiddenMemberFields {
 		if m.Name == v {
+			return true
+		}
+	}
+	return false
+}
+
+func hiddenType(m *types.Type, c generatorConfig) bool {
+	for _, v := range c.HiddenMemberFields {
+		if m.Name.Name == v {
 			return true
 		}
 	}
@@ -565,51 +613,15 @@ func packageMapToList(pkgs map[string]*apiPackage) []*apiPackage {
 	return out
 }
 
-func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
-	references := findTypeReferences(pkgs)
-	typePkgMap := extractTypeToPackageMap(pkgs)
-
-	t, err := template.New("").Funcs(map[string]interface{}{
-		"isExportedType":     isExportedType,
-		"fieldName":          fieldName,
-		"fieldEmbedded":      fieldEmbedded,
-		"typeIdentifier":     func(t *types.Type) string { return typeIdentifier(t) },
-		"typeDisplayName":    func(t *types.Type) string { return typeDisplayName(t, config, typePkgMap) },
-		"visibleTypes":       func(t []*types.Type) []*types.Type { return visibleTypes(t, config) },
-		"renderComments":     func(s []string) string { return renderComments(s, !config.MarkdownDisabled) },
-		"packageDisplayName": func(p *apiPackage) string { return p.identifier() },
-		"apiGroup":           func(t *types.Type) string { return apiGroupForType(t, typePkgMap) },
-		"packageAnchorID": func(p *apiPackage) string {
-			// TODO(ahmetb): currently this is the same as packageDisplayName
-			// func, and it's fine since it retuns valid DOM id strings like
-			// 'serving.knative.dev/v1alpha1' which is valid per HTML5, except
-			// spaces, so just trim those.
-			return strings.Replace(p.identifier(), " ", "", -1)
-		},
-		"linkForType": func(t *types.Type) string {
-			v, err := linkForType(t, config, typePkgMap)
-			if err != nil {
-				klog.Fatal(errors.Wrapf(err, "error getting link for type=%s", t.Name))
-				return ""
-			}
-			return v
-		},
-		"anchorIDForType":  func(t *types.Type) string { return anchorIDForLocalType(t, typePkgMap) },
-		"safe":             safe,
-		"sortedTypes":      sortTypes,
-		"typeReferences":   func(t *types.Type) []*types.Type { return typeReferences(t, config, references) },
-		"hiddenMember":     func(m types.Member) bool { return hiddenMember(m, config) },
-		"isLocalType":      isLocalType,
-		"isOptionalMember": isOptionalMember,
-	}).ParseGlob(filepath.Join(*flTemplateDir, "*.tpl"))
-	if err != nil {
-		return errors.Wrap(err, "parse error")
+func genMemberTypes(typ *types.Type, typs *[]*types.Type, typePkgMap map[*types.Type]*apiPackage) {
+	if typ.Kind == types.Slice {
+		typ = typ.Elem
 	}
-
-	gitCommit, _ := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
-	return errors.Wrap(t.ExecuteTemplate(w, "packages", map[string]interface{}{
-		"packages":  pkgs,
-		"config":    config,
-		"gitCommit": strings.TrimSpace(string(gitCommit)),
-	}), "template execution error")
+	if _, ok := typePkgMap[typ]; !ok {
+		return
+	}
+	*typs = append(*typs, typ)
+	for _, member := range typ.Members {
+		genMemberTypes(member.Type, typs, typePkgMap)
+	}
 }
