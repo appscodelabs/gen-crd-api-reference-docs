@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html/template"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -14,11 +13,10 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	texttemplate "text/template"
+	"text/template"
 	"unicode"
 
 	"github.com/pkg/errors"
-	"github.com/russross/blackfriday/v2"
 	"k8s.io/gengo/parser"
 	"k8s.io/gengo/types"
 	"k8s.io/klog"
@@ -31,6 +29,12 @@ var (
 
 	flOutDir = flag.String("out-dir", "", "path to the directory to save the results")
 )
+
+type SensitiveData struct {
+	Name        string
+	Type        string
+	Description string
+}
 
 type generatorConfig struct {
 	// HiddenMemberFields hides fields with specified names on all types.
@@ -150,8 +154,9 @@ func main() {
 
 			x := make([]*types.Type, 0)
 
-			fileName := filepath.Join(dir, typ.Name.Name+".html")
-			genMemberTypes(typ, &x, typePkgMap)
+			fileName := filepath.Join(dir, typ.Name.Name+".md")
+			var sensitiveData []SensitiveData
+			genMemberTypes(typ, &x, typePkgMap, "", &sensitiveData)
 			pkg := apiPackages[i]
 			pkg.Types = x
 
@@ -168,7 +173,7 @@ func main() {
 				"typeIdentifier":     func(t *types.Type) string { return typeIdentifier(t) },
 				"typeDisplayName":    func(t *types.Type) string { return typeDisplayName(t, config, typPkgMap) },
 				"visibleTypes":       func(t []*types.Type) []*types.Type { return visibleTypes(t, config) },
-				"renderComments":     func(s []string) string { return renderComments(s, !config.MarkdownDisabled) },
+				"renderComments":     func(s []string) string { return renderComments(s) },
 				"packageDisplayName": func(p *apiPackage) string { return p.identifier() },
 				"apiGroup":           func(t *types.Type) string { return apiGroupForType(t, typPkgMap) },
 				"packageAnchorID": func(p *apiPackage) string {
@@ -187,7 +192,6 @@ func main() {
 					return v
 				},
 				"anchorIDForType":  func(t *types.Type) string { return anchorIDForLocalType(t, typPkgMap) },
-				"safe":             safe,
 				"sortedTypes":      sortTypes,
 				"typeReferences":   func(t *types.Type) []*types.Type { return typeReferences(t, config, references) },
 				"hiddenMember":     func(m types.Member) bool { return hiddenMember(m, config) },
@@ -201,9 +205,10 @@ func main() {
 			gitCommit, _ := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
 
 			err = t.ExecuteTemplate(&b, "packages", map[string]interface{}{
-				"packages":  pkgs,
-				"config":    config,
-				"gitCommit": strings.TrimSpace(string(gitCommit)),
+				"packages":      pkgs,
+				"config":        config,
+				"gitCommit":     strings.TrimSpace(string(gitCommit)),
+				"sensitiveData": sensitiveData,
 			})
 			if err != nil {
 				klog.Fatal(errors.Wrap(err, "template execution error"))
@@ -350,36 +355,27 @@ func isLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) bool {
 	return ok
 }
 
-func renderComments(s []string, markdown bool) string {
+func renderComments(s []string) string {
 	s = filterCommentTags(s)
 	doc := strings.Join(s, "\n")
 
-	if markdown {
-		// TODO(ahmetb): when a comment includes stuff like "http://<service>"
-		// we treat this as a HTML tag with markdown renderer below. solve this.
-		return string(blackfriday.Run([]byte(doc)))
-	}
-	return nl2br(doc)
+	return doc
 }
 
-func safe(s string) template.HTML { return template.HTML(s) }
+//func safe(s string) template.HTML { return template.HTML(s) }
 
-func nl2br(s string) string {
-	return strings.Replace(s, "\n\n", string(template.HTML("<br/><br/>")), -1)
-}
+//func nl2br(s string) string {
+//	return strings.Replace(s, "\n\n", string(template.HTML("<br/><br/>")), -1)
+//}
 
 func hiddenMember(m types.Member, c generatorConfig) bool {
+	v := reflect.StructTag(m.Tags).Get("sensitive")
+	if v == "true" {
+		return true
+	}
+
 	for _, v := range c.HiddenMemberFields {
 		if m.Name == v {
-			return true
-		}
-	}
-	return false
-}
-
-func hiddenType(m *types.Type, c generatorConfig) bool {
-	for _, v := range c.HiddenMemberFields {
-		if m.Name.Name == v {
 			return true
 		}
 	}
@@ -406,7 +402,7 @@ func apiGroupForType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) stri
 
 // anchorIDForLocalType returns the #anchor string for the local type
 func anchorIDForLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) string {
-	return fmt.Sprintf("%s.%s", apiGroupForType(t, typePkgMap), t.Name.Name)
+	return t.Name.Name
 }
 
 // linkForType returns an anchor to the type if it can be generated. returns
@@ -435,7 +431,7 @@ func linkForType(t *types.Type, c generatorConfig, typePkgMap map[*types.Type]*a
 				return "", errors.Wrapf(err, "pattern %q failed to compile", v.TypeMatchPrefix)
 			}
 			if r.MatchString(id) {
-				tpl, err := texttemplate.New("").Funcs(map[string]interface{}{
+				tpl, err := template.New("").Funcs(map[string]interface{}{
 					"lower":    strings.ToLower,
 					"arrIndex": arrIndex,
 				}).Parse(v.DocsURLTemplate)
@@ -444,12 +440,11 @@ func linkForType(t *types.Type, c generatorConfig, typePkgMap map[*types.Type]*a
 				}
 
 				var b bytes.Buffer
-				if err := tpl.
-					Execute(&b, map[string]interface{}{
-						"TypeIdentifier":  t.Name.Name,
-						"PackagePath":     t.Name.Package,
-						"PackageSegments": segments,
-					}); err != nil {
+				if err := tpl.Execute(&b, map[string]interface{}{
+					"TypeIdentifier":  t.Name.Name,
+					"PackagePath":     t.Name.Package,
+					"PackageSegments": segments,
+				}); err != nil {
 					return "", errors.Wrap(err, "docs url template execution error")
 				}
 				return b.String(), nil
@@ -557,14 +552,6 @@ func visibleTypes(in []*types.Type, c generatorConfig) []*types.Type {
 	return out
 }
 
-func packageDisplayName(pkg *types.Package, apiVersions map[string]string) string {
-	apiGroupVersion, ok := apiVersions[pkg.Path]
-	if ok {
-		return apiGroupVersion
-	}
-	return pkg.Path // go import path
-}
-
 func filterCommentTags(comments []string) []string {
 	var out []string
 	for _, v := range comments {
@@ -613,7 +600,7 @@ func packageMapToList(pkgs map[string]*apiPackage) []*apiPackage {
 	return out
 }
 
-func genMemberTypes(typ *types.Type, typs *[]*types.Type, typePkgMap map[*types.Type]*apiPackage) {
+func genMemberTypes(typ *types.Type, typs *[]*types.Type, typePkgMap map[*types.Type]*apiPackage, tempStr string, sensitiveOutput *[]SensitiveData) {
 	if typ.Kind == types.Slice {
 		typ = typ.Elem
 	}
@@ -622,6 +609,28 @@ func genMemberTypes(typ *types.Type, typs *[]*types.Type, typePkgMap map[*types.
 	}
 	*typs = append(*typs, typ)
 	for _, member := range typ.Members {
-		genMemberTypes(member.Type, typs, typePkgMap)
+		var temp string
+		if tempStr == "" {
+			temp = strings.ReplaceAll(reflect.StructTag(member.Tags).Get("tf"), ",omitempty", "")
+		} else {
+			temp = tempStr + "." + strings.ReplaceAll(reflect.StructTag(member.Tags).Get("tf"), ",omitempty", "")
+		}
+		if member.Type.Kind == types.Slice {
+			temp = temp + "." + "<index>"
+		}
+		if reflect.StructTag(member.Tags).Get("sensitive") == "true" {
+			var typ string
+			if member.Type == types.String {
+				typ = "string"
+			} else {
+				typ = "map[string]string"
+			}
+			*sensitiveOutput = append(*sensitiveOutput, SensitiveData{
+				Name:        temp,
+				Type:        typ,
+				Description: renderComments(member.CommentLines),
+			})
+		}
+		genMemberTypes(member.Type, typs, typePkgMap, temp, sensitiveOutput)
 	}
 }

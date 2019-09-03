@@ -8,3 +8,5 @@ require (
 	k8s.io/klog v0.3.1
 	kubeform.dev/kubeform v0.0.2 // indirect
 )
+
+go 1.13
