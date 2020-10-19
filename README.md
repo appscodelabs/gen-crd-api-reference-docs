@@ -3,7 +3,7 @@
 If you have a project that is Custom Resource Definitions and wanted to generate
 API Reference Docs [like this][ar] this tool is for you.
 
-[ar]: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.13/
+[ar]: https://v1-18.docs.kubernetes.io/docs/reference/generated/kubernetes-api/v1.18/
 
 ## Current Users
 
